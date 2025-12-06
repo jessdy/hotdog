@@ -1,0 +1,107 @@
+# 多阶段构建：builder 阶段编译扩展，runtime 阶段运行 PG
+FROM postgres:18-alpine AS builder
+
+# 安装构建依赖（添加 cmake、g++、clang 和 llvm）
+RUN apk add --no-cache \
+    build-base \
+    postgresql18-dev \
+    git \
+    python3 \
+    python3-dev \
+    py3-pip \
+    icu-dev \
+    cmake \
+    g++ \
+    clang \
+    llvm \
+    llvm-dev
+
+# 创建 Python 虚拟环境（你的原步骤，用于其他依赖？）
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+RUN pip install --upgrade pip
+
+# 复制 requirements.txt 并安装 Python 包（如果需要）
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+# 4. 编译 vector (向量类型)
+# vector 插件需要 clang 编译器
+RUN git clone https://github.com/pgvector/pgvector.git /tmp/pgvector
+WORKDIR /tmp/pgvector
+# 设置 clang 符号链接并创建 llvm-lto 包装脚本（跳过可选的 LTO 优化）
+RUN CLANG_MAJOR=$(clang --version | grep -oE 'version [0-9]+' | grep -oE '[0-9]+' | head -n1) && \
+    echo "Detected clang version: ${CLANG_MAJOR}" && \
+    ln -sf /usr/bin/clang /usr/bin/clang-${CLANG_MAJOR} && \
+    ln -sf /usr/bin/clang /usr/bin/clang-19 && \
+    mkdir -p /usr/lib/llvm${CLANG_MAJOR}/bin /usr/lib/llvm19/bin && \
+    printf '#!/bin/sh\n# Wrapper script that skips LTO optimization (optional step)\necho "Skipping LTO optimization step (optional)"\nexit 0\n' > /usr/lib/llvm${CLANG_MAJOR}/bin/llvm-lto && \
+    chmod +x /usr/lib/llvm${CLANG_MAJOR}/bin/llvm-lto && \
+    ln -sf /usr/lib/llvm${CLANG_MAJOR}/bin/llvm-lto /usr/lib/llvm19/bin/llvm-lto && \
+    make CC=clang && \
+    make install
+
+# 编译 pg_cron (定时任务扩展)
+RUN git clone https://github.com/citusdata/pg_cron.git /tmp/pg_cron
+WORKDIR /tmp/pg_cron
+RUN make && make install
+
+# 克隆 pg_jieba 并初始化子模块（关键修复）
+RUN git clone https://github.com/jaiminpan/pg_jieba.git /tmp/pg-jieba \
+    && cd /tmp/pg-jieba \
+    && git submodule update --init --recursive
+
+WORKDIR /tmp/pg-jieba
+RUN sed -i 's/cmake_minimum_required(VERSION 3\.0)/cmake_minimum_required(VERSION 3.5)/g; \
+            s/cmake_minimum_required(VERSION 3\.1)/cmake_minimum_required(VERSION 3.5)/g; \
+            s/cmake_minimum_required(VERSION 3\.2)/cmake_minimum_required(VERSION 3.5)/g; \
+            s/cmake_minimum_required(VERSION 3\.3)/cmake_minimum_required(VERSION 3.5)/g; \
+            s/cmake_minimum_required(VERSION 3\.4)/cmake_minimum_required(VERSION 3.5)/g' CMakeLists.txt && \
+    mkdir build && cd build && \
+    cmake .. -DCMAKE_CXX_FLAGS="-std=c++11" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 && \ 
+    make -j$(getconf _NPROCESSORS_ONLN) && \  
+    make install
+
+# 可选：打包扩展文件，便于 runtime 阶段复制（减小镜像）
+RUN PG_LIBDIR=$(pg_config --pkglibdir) && \
+    PG_SHAREDIR=$(pg_config --sharedir) && \
+    mkdir -p /pg_extensions/build/tmp/lib /pg_extensions/build/tmp/share/extension && \
+    find $PG_LIBDIR -name "pg_jieba.so" -exec cp {} /pg_extensions/build/tmp/lib/ \; && \
+    find $PG_SHAREDIR/extension -name "pg_jieba*" -exec cp {} /pg_extensions/build/tmp/share/extension/ \; && \
+    find $PG_LIBDIR -name "vector.so" -exec cp {} /pg_extensions/build/tmp/lib/ \; && \
+    find $PG_SHAREDIR/extension -name "vector*" -exec cp {} /pg_extensions/build/tmp/share/extension/ \; && \
+    find $PG_LIBDIR -name "pg_cron.so" -exec cp {} /pg_extensions/build/tmp/lib/ \; && \
+    find $PG_SHAREDIR/extension -name "pg_cron*" -exec cp {} /pg_extensions/build/tmp/share/extension/ \; && \
+    tar czf /pg_extensions/build/pgextensions.tar.gz -C /pg_extensions/build/tmp lib share && \
+    rm -rf /pg_extensions/build/tmp /tmp/pg-jieba /tmp/pgvector /tmp/pg_cron
+
+# Runtime 阶段：基础 PG 镜像 + 扩展
+FROM postgres:18-alpine
+
+# 安装运行时依赖（icu 和 plpython3u）
+RUN apk add --no-cache icu-libs postgresql18-plpython3
+
+# 复制编译好的扩展
+COPY --from=builder /pg_extensions/build/pgextensions.tar.gz /
+RUN PG_LIBDIR=$(pg_config --pkglibdir) && \
+    PG_SHAREDIR=$(pg_config --sharedir) && \
+    mkdir -p /tmp/pgextensions-extract && \
+    tar zxf /pgextensions.tar.gz -C /tmp/pgextensions-extract && \
+    cp -r /tmp/pgextensions-extract/lib/* $PG_LIBDIR/ && \
+    cp -r /tmp/pgextensions-extract/share/extension/* $PG_SHAREDIR/extension/ && \
+    rm -rf /tmp/pgextensions-extract /pgextensions.tar.gz
+
+# 配置扩展：自动创建扩展（在 initdb 时运行）
+RUN mkdir -p /docker-entrypoint-initdb.d && \
+    echo "CREATE EXTENSION IF NOT EXISTS vector;" > /docker-entrypoint-initdb.d/01-vector.sql && \
+    echo "CREATE EXTENSION IF NOT EXISTS plpython3u;" > /docker-entrypoint-initdb.d/02-plpython3u.sql && \
+    echo "CREATE EXTENSION IF NOT EXISTS pg_cron;" > /docker-entrypoint-initdb.d/03-pg_cron.sql && \
+    echo "CREATE EXTENSION IF NOT EXISTS pg_jieba;" > /docker-entrypoint-initdb.d/10-pg_jieba.sql && \
+    printf '#!/bin/bash\nset -e\n# 配置 pg_cron 需要 shared_preload_libraries\necho "shared_preload_libraries = '\''pg_cron'\''" >> "$PGDATA/postgresql.conf"\n' > /docker-entrypoint-initdb.d/00-pg_cron-config.sh && \
+    chmod +x /docker-entrypoint-initdb.d/00-pg_cron-config.sh
+
+# 暴露 PG 端口
+EXPOSE 5432
+
+# 使用官方 PG entrypoint
+CMD ["docker-entrypoint.sh", "postgres"]

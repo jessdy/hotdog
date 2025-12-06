@@ -1,0 +1,70 @@
+spring:
+  application:
+    name: hotdog
+  
+  datasource:
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5433/hotdog}
+    username: ${SPRING_DATASOURCE_USERNAME:postgres}
+    password: ${SPRING_DATASOURCE_PASSWORD:postgres}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 5
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+  
+  jpa:
+    hibernate:
+      ddl-auto: ${SPRING_JPA_HIBERNATE_DDL_AUTO:validate}
+    show-sql: ${SPRING_JPA_SHOW_SQL:false}
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+        jdbc:
+          time_zone: ${TZ:Asia/Shanghai}
+        use_sql_comments: true
+  
+  jackson:
+    time-zone: ${TZ:Asia/Shanghai}
+    serialization:
+      write-dates-as-timestamps: false
+
+server:
+  port: ${APP_PORT:8080}
+  error:
+    include-message: always
+    include-binding-errors: always
+    include-stacktrace: on_param
+    include-exception: false
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: when-authorized
+
+# HotDog 应用配置
+hotdog:
+  embedding:
+    batch-size: 1500
+    model-name: BAAI/bge-large-zh-v1.5
+  clustering:
+    default-hours: 24
+    default-eps: 0.38
+    default-min-samples: 3
+
+logging:
+  level:
+    root: INFO
+    com.hotdog: DEBUG
+    org.springframework.web: INFO
+    org.hibernate.SQL: ${SPRING_JPA_SHOW_SQL:false}
+    org.hibernate.type.descriptor.sql.BasicBinder: ${SPRING_JPA_SHOW_SQL:false}
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} - %msg%n"
+    file: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"

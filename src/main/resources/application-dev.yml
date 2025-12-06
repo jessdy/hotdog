@@ -1,0 +1,12 @@
+spring:
+  jpa:
+    show-sql: true
+    hibernate:
+      ddl-auto: update
+
+logging:
+  level:
+    com.hotdog: DEBUG
+    org.springframework.web: DEBUG
+    org.hibernate.SQL: true
+    org.hibernate.type.descriptor.sql.BasicBinder: TRACE

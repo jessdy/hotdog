@@ -1,0 +1,13 @@
+# 开发环境覆盖配置示例
+# 复制此文件为 docker-compose.override.yml 以启用开发配置
+
+version: '3.8'
+
+services:
+  app:
+    # 开发环境可以挂载源代码
+    volumes:
+      - ./src:/app/src:ro
+    environment:
+      SPRING_PROFILES_ACTIVE: dev
+      SPRING_JPA_SHOW_SQL: "true"
