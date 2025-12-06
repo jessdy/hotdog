@@ -83,3 +83,5 @@ application-local.properties
 
 # Virtual machine crash logs
 hs_err_pid*
+
+sync_config.jsonc
