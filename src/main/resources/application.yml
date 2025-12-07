@@ -3,7 +3,7 @@ spring:
     name: hotdog
   
   datasource:
-    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://localhost:5433/hotdog}
+    url: ${SPRING_DATASOURCE_URL:jdbc:postgresql://10.10.10.252:5433/postgres}
     username: ${SPRING_DATASOURCE_USERNAME:postgres}
     password: ${SPRING_DATASOURCE_PASSWORD:postgres}
     driver-class-name: org.postgresql.Driver

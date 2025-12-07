@@ -1,18 +1,17 @@
 package com.hotdog.service;
 
 import com.hotdog.dto.HotEventResponseDTO;
+import com.hotdog.config.SystemContext;
 import com.hotdog.model.Article;
 import com.hotdog.model.HotEvent;
 import com.hotdog.repository.ArticleRepository;
 import com.hotdog.repository.HotEventRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.data.domain.PageRequest;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.math.BigDecimal;
 import java.sql.Array;
 import java.util.ArrayList;
 import java.util.Arrays;

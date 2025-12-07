@@ -15,7 +15,7 @@ import java.time.LocalDateTime;
 @Table(name = "hotd_event_articles", indexes = {
     @Index(name = "hotd_idx_event_articles_cluster", columnList = "cluster_id"),
     @Index(name = "hotd_idx_event_articles_article", columnList = "article_id"),
-    @Index(name = "hotd_idx_event_articles_snapshot", columnList = "snapshot_time, rank_no")
+    @Index(name = "hotd_idx_event_articles_snapshot", columnList = "snapshot_time, rank_no, system_id")
 })
 @IdClass(HotEventArticleId.class)
 @Data
@@ -48,7 +48,8 @@ public class HotEventArticle {
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumns({
         @JoinColumn(name = "snapshot_time", insertable = false, updatable = false),
-        @JoinColumn(name = "rank_no", insertable = false, updatable = false)
+        @JoinColumn(name = "rank_no", insertable = false, updatable = false),
+        @JoinColumn(name = "system_id", insertable = false, updatable = false)
     })
     private HotEvent hotEvent;
     

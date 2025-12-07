@@ -23,7 +23,10 @@ public class EmbeddingService {
     public void triggerBatchEmbedding() {
         log.info("触发批量向量化...");
         try {
-            jdbcTemplate.execute("SELECT hotd_embed_articles_batch()");
+            // 对于返回 void 的函数，使用 query 方法执行 SELECT 语句并忽略结果
+            jdbcTemplate.query("SELECT hotd_embed_articles_batch()", rs -> {
+                // 函数返回 void，忽略结果集
+            });
             log.info("批量向量化完成");
         } catch (Exception e) {
             log.error("批量向量化失败", e);

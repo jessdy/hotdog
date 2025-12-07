@@ -19,8 +19,8 @@ services:
       # 可选：PostgreSQL 配置
       POSTGRES_INITDB_ARGS: "-E UTF8 --locale=C"
     volumes:
-      # 数据持久化
-      - ../postgres-data:/var/lib/postgresql/data
+      # 数据持久化（PostgreSQL 18+ 使用 /var/lib/postgresql 而不是 /var/lib/postgresql/data）
+      - ../postgres-data:/var/lib/postgresql
       # 挂载初始化 SQL 脚本
       - ../postgres-build-dir/init.sql:/docker-entrypoint-initdb.d/99-init.sql:ro
     healthcheck:

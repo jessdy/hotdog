@@ -29,7 +29,7 @@ public class SystemConfig {
     @Column(name = "default_hours")
     private Integer defaultHours = 24;
     
-    @Column(name = "default_eps", precision = 5, scale = 2)
+    @Column(name = "default_eps", columnDefinition = "FLOAT")
     private Float defaultEps = 0.38f;
     
     @Column(name = "default_min_samples")

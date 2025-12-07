@@ -6,6 +6,7 @@ import com.hotdog.dto.ArticleQueryDTO;
 import com.hotdog.dto.ArticleShareDTO;
 import com.hotdog.model.Article;
 import com.hotdog.model.ArticleSystem;
+import com.hotdog.model.ArticleSystemId;
 import com.hotdog.repository.ArticleRepository;
 import com.hotdog.repository.ArticleSystemRepository;
 import lombok.RequiredArgsConstructor;

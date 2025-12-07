@@ -29,6 +29,20 @@ if [ "$(docker ps -aq -f name=${CONTAINER_NAME})" ]; then
     fi
 fi
 
+# 检查数据目录是否存在且包含数据库
+if [ -d "${DATA_DIR}" ] && [ -n "$(ls -A ${DATA_DIR} 2>/dev/null)" ]; then
+    echo "数据目录 ${DATA_DIR} 已存在且不为空"
+    read -p "是否删除数据目录并重新初始化? (y/N): " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        echo "删除数据目录..."
+        rm -rf ${DATA_DIR}
+        echo "数据目录已删除"
+    else
+        echo "保留现有数据目录（如果配置有问题，PostgreSQL 可能无法启动）"
+    fi
+fi
+
 # 创建数据目录
 mkdir -p ${DATA_DIR}
 
@@ -45,7 +59,7 @@ docker run -d \
     -e POSTGRES_USER=${POSTGRES_USER} \
     -e POSTGRES_PASSWORD=${POSTGRES_PASSWORD} \
     -e POSTGRES_DB=${POSTGRES_DB} \
-    -v $(pwd)/${DATA_DIR}:/var/lib/postgresql/data \
+    -v $(pwd)/${DATA_DIR}:/var/lib/postgresql \
     ${IMAGE_NAME}
 
 # 等待容器启动

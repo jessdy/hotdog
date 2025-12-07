@@ -1,45 +1,54 @@
-# 多阶段构建：builder 阶段编译扩展，runtime 阶段运行 PG
-FROM postgres:18-alpine AS builder
+# 多阶段构建：python-builder 阶段安装 Python 包，builder 阶段编译扩展，runtime 阶段运行 PG
 
-# 安装构建依赖（添加 cmake、g++、clang 和 llvm）
-RUN apk add --no-cache \
-    build-base \
-    postgresql18-dev \
+# Python 包安装阶段：使用 Debian 基础镜像安装 Python 包（PyTorch 在 Alpine 上不兼容）
+# 注意：使用与 Alpine PostgreSQL 兼容的 Python 版本（3.11）
+FROM python:3.11-slim AS python-builder
+
+WORKDIR /opt/venv
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# 升级 pip 并安装 Python 依赖
+RUN pip install --upgrade pip setuptools wheel
+COPY requirements.txt /tmp/requirements.txt
+# 安装所有依赖（PyTorch CPU-only 版本）
+# 配置 pip 使用多个索引：主索引为官方 PyPI，额外索引为 PyTorch CPU 源
+# 如果清华镜像可用，可以取消下面的注释使用加速
+# RUN pip config set global.index-url https://pypi.tuna.tsinghua.edu.cn/simple && \
+#     pip config set global.extra-index-url https://download.pytorch.org/whl/cpu
+RUN pip install --extra-index-url https://download.pytorch.org/whl/cpu -r /tmp/requirements.txt && \
+    cp /tmp/requirements.txt /opt/requirements.txt
+
+# 回到 builder 阶段继续编译扩展
+# 注意：由于运行时使用 Debian，builder 阶段也使用 Debian 以确保库兼容性
+FROM postgres:18 AS builder
+
+# 安装构建依赖（Debian 使用 apt）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    postgresql-server-dev-18 \
     git \
     python3 \
     python3-dev \
-    py3-pip \
-    icu-dev \
+    python3-pip \
+    libicu-dev \
     cmake \
     g++ \
     clang \
     llvm \
-    llvm-dev
+    llvm-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# 创建 Python 虚拟环境（你的原步骤，用于其他依赖？）
-RUN python3 -m venv /opt/venv
+# 从 python-builder 复制已安装的 Python 虚拟环境
+COPY --from=python-builder /opt/venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
-RUN pip install --upgrade pip
-
-# 复制 requirements.txt 并安装 Python 包（如果需要）
-COPY requirements.txt .
-RUN pip install -r requirements.txt
 
 # 4. 编译 vector (向量类型)
-# vector 插件需要 clang 编译器
+# vector 插件可以使用 gcc 或 clang 编译器
 RUN git clone https://github.com/pgvector/pgvector.git /tmp/pgvector
 WORKDIR /tmp/pgvector
-# 设置 clang 符号链接并创建 llvm-lto 包装脚本（跳过可选的 LTO 优化）
-RUN CLANG_MAJOR=$(clang --version | grep -oE 'version [0-9]+' | grep -oE '[0-9]+' | head -n1) && \
-    echo "Detected clang version: ${CLANG_MAJOR}" && \
-    ln -sf /usr/bin/clang /usr/bin/clang-${CLANG_MAJOR} && \
-    ln -sf /usr/bin/clang /usr/bin/clang-19 && \
-    mkdir -p /usr/lib/llvm${CLANG_MAJOR}/bin /usr/lib/llvm19/bin && \
-    printf '#!/bin/sh\n# Wrapper script that skips LTO optimization (optional step)\necho "Skipping LTO optimization step (optional)"\nexit 0\n' > /usr/lib/llvm${CLANG_MAJOR}/bin/llvm-lto && \
-    chmod +x /usr/lib/llvm${CLANG_MAJOR}/bin/llvm-lto && \
-    ln -sf /usr/lib/llvm${CLANG_MAJOR}/bin/llvm-lto /usr/lib/llvm19/bin/llvm-lto && \
-    make CC=clang && \
-    make install
+# 在 Debian 上可以使用 gcc 或 clang，优先使用 gcc（更简单）
+RUN make && make install
 
 # 编译 pg_cron (定时任务扩展)
 RUN git clone https://github.com/citusdata/pg_cron.git /tmp/pg_cron
@@ -60,45 +69,153 @@ RUN sed -i 's/cmake_minimum_required(VERSION 3\.0)/cmake_minimum_required(VERSIO
     mkdir build && cd build && \
     cmake .. -DCMAKE_CXX_FLAGS="-std=c++11" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 && \ 
     make -j$(getconf _NPROCESSORS_ONLN) && \  
-    make install
+    make install && \
+    # 验证 pg_jieba 扩展是否安装成功
+    PG_LIBDIR=$(pg_config --pkglibdir) && \
+    PG_SHAREDIR=$(pg_config --sharedir) && \
+    echo "Verifying pg_jieba installation..." && \
+    ls -la $PG_LIBDIR/pg_jieba.so && \
+    ls -la $PG_SHAREDIR/extension/pg_jieba* && \
+    # 确保所有 pg_jieba 必需文件被安装到正确位置
+    # pg_jieba 需要：jieba_base.dict, jieba_hmm.model, jieba_user.dict, jieba.idf, jieba.stopword.utf8 等
+    PG_SHAREDIR=$(pg_config --sharedir) && \
+    mkdir -p $PG_SHAREDIR/tsearch_data && \
+    # 首先检查 make install 是否已经安装了文件
+    echo "Checking installed files in $PG_SHAREDIR/tsearch_data:" && \
+    ls -la $PG_SHAREDIR/tsearch_data/ 2>/dev/null || echo "tsearch_data directory is empty" && \
+    # 从源码目录查找所有 jieba 相关文件（包括子模块）
+    echo "Searching for jieba files in source directory..." && \
+    find /tmp/pg-jieba -type f \( -name "*jieba*.dict" -o -name "*jieba*.model" -o -name "*jieba*.idf" -o -name "*jieba*.utf8" -o -name "jieba*" \) -exec echo "Found: {}" \; && \
+    # 复制所有找到的文件
+    find /tmp/pg-jieba -type f \( -name "*jieba*.dict" -o -name "*jieba*.model" -o -name "*jieba*.idf" -o -name "*jieba*.utf8" -o -name "jieba*" \) -exec cp {} $PG_SHAREDIR/tsearch_data/ \; 2>/dev/null || true && \
+    # 如果还没有找到，尝试从 dict 目录复制
+    [ ! -f "$PG_SHAREDIR/tsearch_data/jieba_base.dict" ] && find /tmp/pg-jieba -path "*/dict/*" -type f -exec cp {} $PG_SHAREDIR/tsearch_data/ \; 2>/dev/null || true && \
+    # 列出最终安装的文件
+    echo "Final files in $PG_SHAREDIR/tsearch_data:" && \
+    ls -la $PG_SHAREDIR/tsearch_data/ || true
 
 # 可选：打包扩展文件，便于 runtime 阶段复制（减小镜像）
 RUN PG_LIBDIR=$(pg_config --pkglibdir) && \
     PG_SHAREDIR=$(pg_config --sharedir) && \
-    mkdir -p /pg_extensions/build/tmp/lib /pg_extensions/build/tmp/share/extension && \
-    find $PG_LIBDIR -name "pg_jieba.so" -exec cp {} /pg_extensions/build/tmp/lib/ \; && \
-    find $PG_SHAREDIR/extension -name "pg_jieba*" -exec cp {} /pg_extensions/build/tmp/share/extension/ \; && \
+    mkdir -p /pg_extensions/build/tmp/lib /pg_extensions/build/tmp/share/extension /pg_extensions/build/tmp/share/tsearch_data && \
+    echo "Searching for pg_jieba files..." && \
+    echo "PG_LIBDIR: $PG_LIBDIR" && \
+    echo "PG_SHAREDIR: $PG_SHAREDIR" && \
+    find $PG_LIBDIR -name "*jieba*" -ls && \
+    find $PG_SHAREDIR/extension -name "*jieba*" -ls && \
+    find $PG_LIBDIR -name "pg_jieba.so" -exec cp -v {} /pg_extensions/build/tmp/lib/ \; && \
+    find $PG_SHAREDIR/extension -name "pg_jieba*" -exec cp -v {} /pg_extensions/build/tmp/share/extension/ \; && \
+    # 复制所有 jieba 相关文件（包括 .dict, .model, .idf, .utf8 等）
+    find $PG_SHAREDIR/tsearch_data -type f \( -name "jieba*" -o -name "*jieba*" \) -exec cp -v {} /pg_extensions/build/tmp/share/tsearch_data/ \; 2>/dev/null || true && \
+    echo "Files packaged for pg_jieba extension:" && \
+    ls -la /pg_extensions/build/tmp/lib/*jieba* 2>/dev/null || echo "No pg_jieba.so found" && \
+    ls -la /pg_extensions/build/tmp/share/extension/*jieba* 2>/dev/null || echo "No pg_jieba extension files found" && \
+    echo "Files packaged for tsearch_data:" && \
+    ls -la /pg_extensions/build/tmp/share/tsearch_data/ 2>/dev/null || echo "No tsearch_data files found" && \
     find $PG_LIBDIR -name "vector.so" -exec cp {} /pg_extensions/build/tmp/lib/ \; && \
     find $PG_SHAREDIR/extension -name "vector*" -exec cp {} /pg_extensions/build/tmp/share/extension/ \; && \
     find $PG_LIBDIR -name "pg_cron.so" -exec cp {} /pg_extensions/build/tmp/lib/ \; && \
     find $PG_SHAREDIR/extension -name "pg_cron*" -exec cp {} /pg_extensions/build/tmp/share/extension/ \; && \
+    echo "All packaged files:" && \
+    find /pg_extensions/build/tmp -type f -ls && \
     tar czf /pg_extensions/build/pgextensions.tar.gz -C /pg_extensions/build/tmp lib share && \
     rm -rf /pg_extensions/build/tmp /tmp/pg-jieba /tmp/pgvector /tmp/pg_cron
 
 # Runtime 阶段：基础 PG 镜像 + 扩展
-FROM postgres:18-alpine
+# 注意：由于 PyTorch 在 Alpine (musl) 上存在库兼容性问题，改用 Debian 基础镜像
+FROM postgres:18
 
-# 安装运行时依赖（icu 和 plpython3u）
-RUN apk add --no-cache icu-libs postgresql18-plpython3
+# 安装运行时依赖（icu、plpython3u 和必要的系统库）
+# Debian 基础镜像使用 apt 包管理器
+# 注意：需要安装 postgresql-plpython3-18 来启用 plpython3u 扩展
+# 需要安装构建工具以编译 numpy 等包
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    postgresql-plpython3-18 \
+    postgresql-contrib-18 \
+    python3 \
+    python3-pip \
+    python3-dev \
+    libicu-dev \
+    gcc \
+    g++ \
+    make \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# 从构建上下文复制 requirements.txt 并在系统 Python 环境中安装依赖
+# 注意：plpython3u 使用系统 Python，不是虚拟环境
+# Debian 基础镜像与 PyTorch 兼容性更好
+# Debian Python 3.13+ 也需要 --break-system-packages 标志（PEP 668）
+COPY requirements.txt /tmp/requirements.txt
+# 在系统 Python 环境中安装依赖（plpython3u 需要使用系统 Python）
+# 注意：跳过 pip 升级（Debian 系统安装的 pip 不能直接卸载），只升级 setuptools 和 wheel
+RUN pip3 install --upgrade setuptools wheel --break-system-packages && \
+    # 安装所有依赖（PyTorch CPU-only 版本在 Debian 上应该可以正常工作）
+    pip3 install --break-system-packages --extra-index-url https://download.pytorch.org/whl/cpu -r /tmp/requirements.txt && \
+    # 验证关键包是否安装成功
+    python3 -c "import numpy; print('numpy version:', numpy.__version__)" && \
+    python3 -c "import sklearn; print('scikit-learn version:', sklearn.__version__)" && \
+    python3 -c "import torch; print('torch version:', torch.__version__)" && \
+    python3 -c "import sentence_transformers; print('sentence-transformers installed')" && \
+    rm /tmp/requirements.txt
 
 # 复制编译好的扩展
 COPY --from=builder /pg_extensions/build/pgextensions.tar.gz /
 RUN PG_LIBDIR=$(pg_config --pkglibdir) && \
     PG_SHAREDIR=$(pg_config --sharedir) && \
-    mkdir -p /tmp/pgextensions-extract && \
+    mkdir -p /tmp/pgextensions-extract $PG_SHAREDIR/tsearch_data && \
     tar zxf /pgextensions.tar.gz -C /tmp/pgextensions-extract && \
+    echo "Extracted files:" && \
+    find /tmp/pgextensions-extract -type f -ls && \
     cp -r /tmp/pgextensions-extract/lib/* $PG_LIBDIR/ && \
     cp -r /tmp/pgextensions-extract/share/extension/* $PG_SHAREDIR/extension/ && \
-    rm -rf /tmp/pgextensions-extract /pgextensions.tar.gz
+    [ -d /tmp/pgextensions-extract/share/tsearch_data ] && cp -r /tmp/pgextensions-extract/share/tsearch_data/* $PG_SHAREDIR/tsearch_data/ || true && \
+    echo "Installed pg_jieba files:" && \
+    ls -la $PG_LIBDIR/*jieba* 2>/dev/null || echo "No pg_jieba.so in lib" && \
+    ls -la $PG_SHAREDIR/extension/*jieba* 2>/dev/null || echo "No pg_jieba extension files" && \
+    echo "Verifying pg_jieba extension files exist:" && \
+    (test -f $PG_LIBDIR/pg_jieba.so && echo "✓ pg_jieba.so exists" || echo "✗ pg_jieba.so missing") && \
+    (test -f $PG_SHAREDIR/extension/pg_jieba.control && echo "✓ pg_jieba.control exists" || echo "✗ pg_jieba.control missing") && \
+    (test -f $PG_SHAREDIR/extension/pg_jieba--*.sql && echo "✓ pg_jieba SQL file exists" || echo "✗ pg_jieba SQL file missing") && \
+    echo "Final tsearch_data files in runtime:" && \
+    ls -la $PG_SHAREDIR/tsearch_data/ 2>/dev/null || echo "No tsearch_data files in runtime" && \
+    rm -rf /tmp/pgextensions-extract /pgextensions.tar.gz && \
+    # 创建模型缓存目录并设置权限（用于 sentence-transformers）
+    mkdir -p /var/lib/postgresql/.cache /tmp/.cache && \
+    chown -R postgres:postgres /var/lib/postgresql/.cache /tmp/.cache && \
+    chmod -R 755 /var/lib/postgresql/.cache /tmp/.cache
 
 # 配置扩展：自动创建扩展（在 initdb 时运行）
 RUN mkdir -p /docker-entrypoint-initdb.d && \
+    echo '#!/bin/bash' > /docker-entrypoint-initdb.d/00-pg_cron-config.sh && \
+    echo 'set -e' >> /docker-entrypoint-initdb.d/00-pg_cron-config.sh && \
+    echo '# 配置 pg_cron 和 pg_jieba 需要 shared_preload_libraries' >> /docker-entrypoint-initdb.d/00-pg_cron-config.sh && \
+    echo '# 检查 pg_jieba.so 是否存在' >> /docker-entrypoint-initdb.d/00-pg_cron-config.sh && \
+    echo 'PG_LIBDIR=$(pg_config --pkglibdir)' >> /docker-entrypoint-initdb.d/00-pg_cron-config.sh && \
+    echo 'if [ -f "$PG_LIBDIR/pg_jieba.so" ]; then' >> /docker-entrypoint-initdb.d/00-pg_cron-config.sh && \
+    echo '    echo "shared_preload_libraries = '\''pg_cron,pg_jieba'\''" >> "$PGDATA/postgresql.conf"' >> /docker-entrypoint-initdb.d/00-pg_cron-config.sh && \
+    echo '    echo "pg_jieba found, added to shared_preload_libraries"' >> /docker-entrypoint-initdb.d/00-pg_cron-config.sh && \
+    echo 'else' >> /docker-entrypoint-initdb.d/00-pg_cron-config.sh && \
+    echo '    echo "shared_preload_libraries = '\''pg_cron'\''" >> "$PGDATA/postgresql.conf"' >> /docker-entrypoint-initdb.d/00-pg_cron-config.sh && \
+    echo '    echo "pg_jieba not found, only pg_cron added to shared_preload_libraries"' >> /docker-entrypoint-initdb.d/00-pg_cron-config.sh && \
+    echo 'fi' >> /docker-entrypoint-initdb.d/00-pg_cron-config.sh && \
+    chmod +x /docker-entrypoint-initdb.d/00-pg_cron-config.sh && \
     echo "CREATE EXTENSION IF NOT EXISTS vector;" > /docker-entrypoint-initdb.d/01-vector.sql && \
     echo "CREATE EXTENSION IF NOT EXISTS plpython3u;" > /docker-entrypoint-initdb.d/02-plpython3u.sql && \
-    echo "CREATE EXTENSION IF NOT EXISTS pg_cron;" > /docker-entrypoint-initdb.d/03-pg_cron.sql && \
-    echo "CREATE EXTENSION IF NOT EXISTS pg_jieba;" > /docker-entrypoint-initdb.d/10-pg_jieba.sql && \
-    printf '#!/bin/bash\nset -e\n# 配置 pg_cron 需要 shared_preload_libraries\necho "shared_preload_libraries = '\''pg_cron'\''" >> "$PGDATA/postgresql.conf"\n' > /docker-entrypoint-initdb.d/00-pg_cron-config.sh && \
-    chmod +x /docker-entrypoint-initdb.d/00-pg_cron-config.sh
+    echo '-- pg_jieba 扩展创建（如果可用）' > /docker-entrypoint-initdb.d/03-pg_jieba.sql && \
+    echo 'DO $$' >> /docker-entrypoint-initdb.d/03-pg_jieba.sql && \
+    echo 'BEGIN' >> /docker-entrypoint-initdb.d/03-pg_jieba.sql && \
+    echo '    -- 检查扩展文件是否存在' >> /docker-entrypoint-initdb.d/03-pg_jieba.sql && \
+    echo '    IF EXISTS (SELECT 1 FROM pg_available_extensions WHERE name = '\''pg_jieba'\'') THEN' >> /docker-entrypoint-initdb.d/03-pg_jieba.sql && \
+    echo '        CREATE EXTENSION IF NOT EXISTS pg_jieba;' >> /docker-entrypoint-initdb.d/03-pg_jieba.sql && \
+    echo '    ELSE' >> /docker-entrypoint-initdb.d/03-pg_jieba.sql && \
+    echo '        RAISE NOTICE '\''pg_jieba extension not available, skipping'\'';' >> /docker-entrypoint-initdb.d/03-pg_jieba.sql && \
+    echo '    END IF;' >> /docker-entrypoint-initdb.d/03-pg_jieba.sql && \
+    echo 'EXCEPTION' >> /docker-entrypoint-initdb.d/03-pg_jieba.sql && \
+    echo '    WHEN OTHERS THEN' >> /docker-entrypoint-initdb.d/03-pg_jieba.sql && \
+    echo '        RAISE NOTICE '\''pg_jieba extension creation failed: %'\'', SQLERRM;' >> /docker-entrypoint-initdb.d/03-pg_jieba.sql && \
+    echo 'END $$;' >> /docker-entrypoint-initdb.d/03-pg_jieba.sql
+    # 注意：pg_cron 扩展的创建在 init.sql 中处理（因为需要处理配置参数可能不存在的情况）
 
 # 暴露 PG 端口
 EXPOSE 5432

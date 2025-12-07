@@ -4,7 +4,28 @@
 CREATE EXTENSION IF NOT EXISTS vector;         -- 向量支持
 CREATE EXTENSION IF NOT EXISTS plpython3u;        -- Python 函数
 CREATE EXTENSION IF NOT EXISTS pg_jieba;          -- 中文分词（可选）
-CREATE EXTENSION IF NOT EXISTS pg_cron;           -- 定时任务
+
+-- pg_cron 扩展需要在 shared_preload_libraries 加载后才能创建
+-- 在 initdb 阶段，配置已写入但尚未生效，需要优雅处理
+DO $$
+BEGIN
+    -- 检查扩展是否已存在
+    IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_cron') THEN
+        BEGIN
+            CREATE EXTENSION pg_cron;
+        EXCEPTION
+            WHEN OTHERS THEN
+                -- 如果配置参数不存在（错误代码 P0001 或其他），这是正常的
+                -- 扩展会在数据库重启后（shared_preload_libraries 生效后）自动可用
+                IF SQLSTATE = 'P0001' OR SQLERRM LIKE '%unrecognized configuration parameter%' THEN
+                    RAISE NOTICE 'pg_cron extension creation deferred (will be available after database restart)';
+                ELSE
+                    -- 其他错误重新抛出
+                    RAISE;
+                END IF;
+        END;
+    END IF;
+END $$;
 
 -- =====================================================
 -- 2. 主表：文章/资讯表
@@ -84,6 +105,35 @@ CREATE OR REPLACE FUNCTION hotd_embed_articles_batch()
 RETURNS void LANGUAGE plpython3u AS $$
     from sentence_transformers import SentenceTransformer
     import numpy as np
+    import os
+
+    # 设置模型缓存目录（确保有写权限）
+    # 优先使用 /tmp/.cache（通常有写权限），如果失败则使用 /var/lib/postgresql/.cache
+    cache_dir = '/tmp/.cache'
+    
+    # 尝试创建 /tmp/.cache 目录
+    try:
+        if not os.path.exists(cache_dir):
+            os.makedirs(cache_dir, mode=0o755, exist_ok=True)
+        # 测试是否有写权限
+        test_file = os.path.join(cache_dir, '.test_write')
+        try:
+            with open(test_file, 'w') as f:
+                f.write('test')
+            os.remove(test_file)
+        except:
+            # 如果 /tmp/.cache 没有写权限，尝试 /var/lib/postgresql/.cache
+            cache_dir = '/var/lib/postgresql/.cache'
+            if not os.path.exists(cache_dir):
+                os.makedirs(cache_dir, mode=0o755, exist_ok=True)
+    except Exception as e:
+        # 如果都失败了，仍然使用 /tmp/.cache（让错误在模型加载时暴露）
+        cache_dir = '/tmp/.cache'
+        plpy.notice(f'警告: 无法创建缓存目录，将使用 {cache_dir}，可能会遇到权限问题')
+    
+    # 设置环境变量，让 sentence-transformers 使用指定的缓存目录
+    os.environ['TRANSFORMERS_CACHE'] = cache_dir
+    os.environ['HF_HOME'] = cache_dir
 
     # 2025 年中文公开最强模型（效果完胜 text2vec / m3e / bge-small）
     # 优先级：效果 > 速度 > 资源
@@ -92,7 +142,8 @@ RETURNS void LANGUAGE plpython3u AS $$
         SD['model'] = SentenceTransformer(
             'BAAI/bge-large-zh-v1.5',
             device='cpu',                              # GPU 服务器就改成 'cuda'
-            trust_remote_code=True
+            trust_remote_code=True,
+            cache_folder=cache_dir                    # 显式指定缓存目录
         )
         # 如果你服务器有 GPU，直接改上面这行 device='cuda' 就行，速度再飞 10 倍
 
@@ -163,7 +214,7 @@ LANGUAGE plpython3u AS $$
     """
     rows = plpy.execute(query)
     if len(rows) < min_samples:
-        return
+        return []  # 返回空列表而不是 None
 
     ids      = [r['id'] for r in rows]
     vectors = np.array([r['embedding'] for r in rows])
@@ -194,17 +245,18 @@ LANGUAGE plpython3u AS $$
         cluster_ids = [i for i, m in zip(ids, mask) if m]
         sample = " | ".join(cluster_titles[:4])
 
-        result.append({
-            'cluster_id': cid,
-            'title': cluster_titles[0],
-            'article_count': count,
-            'total_weight': round(float(total_w), 4),
-            'hot_score': round(float(score), 6),
-            'sample_titles': sample,
-            'article_ids': cluster_ids
-        })
+        # PL/Python set-returning 函数需要返回元组列表，每个元组对应 RETURNS TABLE 中的列
+        result.append((
+            int(cid),                    # cluster_id
+            cluster_titles[0],           # title
+            count,                       # article_count
+            round(float(total_w), 4),    # total_weight
+            round(float(score), 6),      # hot_score
+            sample,                      # sample_titles
+            cluster_ids                  # article_ids
+        ))
 
-    result.sort(key=lambda x: x['hot_score'], reverse=True)
+    result.sort(key=lambda x: x[4], reverse=True)  # 按 hot_score (索引4) 排序
     return result
 $$;
 
@@ -212,18 +264,34 @@ $$;
 -- 7. 定时任务（pg_cron）
 -- =====================================================
 -- 每 8 分钟补一次向量（大模型慢一点，多跑几次）
-SELECT cron.unschedule('hotd-embed-batch');
+-- 优雅地取消调度（如果作业不存在则忽略错误）
+DO $$
+BEGIN
+    PERFORM cron.unschedule('hotd-embed-batch');
+EXCEPTION
+    WHEN OTHERS THEN
+        -- 作业不存在是正常的，忽略错误
+        NULL;
+END $$;
 SELECT cron.schedule('hotd-embed-batch', '*/8 * * * *',
     $$SELECT hotd_embed_articles_batch();$$);
 
 -- 每 12 分钟刷新一次热点快照（包含文章关联关系）
-SELECT cron.unschedule('hotd-refresh-snapshot');
-SELECT cron.schedule('hotd-refresh-snapshot', '*/12 * * * *', $$
+-- 优雅地取消调度（如果作业不存在则忽略错误）
+DO $$
+BEGIN
+    PERFORM cron.unschedule('hotd-refresh-snapshot');
+EXCEPTION
+    WHEN OTHERS THEN
+        -- 作业不存在是正常的，忽略错误
+        NULL;
+END $$;
+SELECT cron.schedule('hotd-refresh-snapshot', '*/12 * * * *', $cron_sql$
     TRUNCATE hotd_event_snapshot CASCADE;  -- CASCADE 会级联删除关联表数据
     TRUNCATE hotd_event_articles;
     
     -- 插入快照数据和文章关联关系（一次性完成）
-    DO $$
+    DO $inner_block$
     DECLARE
         snapshot_ts TIMESTAMPTZ := now();
     BEGIN
@@ -257,8 +325,8 @@ SELECT cron.schedule('hotd-refresh-snapshot', '*/12 * * * *', $$
         FROM ranked_events re
         CROSS JOIN LATERAL unnest(re.article_ids) AS article_id
         LEFT JOIN hotd_articles a ON a.id = article_id;
-    END $$;
-$$);
+    END $inner_block$;
+$cron_sql$);
 
 -- =====================================================
 -- 8. 一键查看当前最热事件（效果最强版）

@@ -1,6 +1,7 @@
 package com.hotdog.repository;
 
 import com.hotdog.model.ArticleSystem;
+import com.hotdog.model.ArticleSystemId;
 import org.springframework.data.jpa.repository.JpaRepository;
 import org.springframework.data.jpa.repository.Modifying;
 import org.springframework.data.jpa.repository.Query;
