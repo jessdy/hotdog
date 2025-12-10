@@ -184,6 +184,177 @@ RETURNS void LANGUAGE plpython3u AS $$
 $$;
 
 -- =====================================================
+-- 5.1. 通过 HTTP API 批量向量化函数（可选方案）
+-- =====================================================
+-- 功能：通过 HTTP API 调用外部 embedding 服务，避免在 PostgreSQL 中加载大型模型
+-- 优势：节省内存、更灵活、可切换不同模型、支持分布式部署
+-- 使用场景：
+--   1. 使用外部 embedding 服务（如 OpenAI、本地 embedding 服务等）
+--   2. PostgreSQL 服务器内存有限，无法加载大型模型
+--   3. 需要动态切换不同的 embedding 模型
+--
+-- 参数说明：
+--   p_api_url: Embedding API 地址，例如：
+--              - 'http://localhost:8000/api/embedding' (本地服务)
+--              - 'https://api.openai.com/v1/embeddings' (OpenAI)
+--              - 'http://10.10.10.252:8080/api/embedding/batch' (自定义服务)
+--   p_api_key: API 密钥（可选，某些服务需要）
+--   p_model_name: 模型名称（可选，某些 API 需要指定）
+--   p_batch_size: 每次 API 调用处理的文本数量（默认 50，避免单次请求过大）
+--
+-- API 请求格式（期望）：
+--   POST {p_api_url}
+--   Headers: 
+--     Content-Type: application/json
+--     Authorization: Bearer {p_api_key} (如果提供)
+--   Body:
+--     {
+--       "texts": ["文本1", "文本2", ...],
+--       "model": "{p_model_name}" (可选)
+--     }
+--
+-- API 响应格式（期望）：
+--   {
+--     "embeddings": [[0.1, 0.2, ...], [0.3, 0.4, ...], ...],
+--     "dimension": 1024
+--   }
+--   或者：
+--   {
+--     "data": [
+--       {"embedding": [0.1, 0.2, ...]},
+--       {"embedding": [0.3, 0.4, ...]}
+--     ]
+--   }
+--
+-- 调用示例：
+--   SELECT hotd_embed_articles_batch_via_api(
+--     'http://localhost:8000/api/embedding',
+--     'your-api-key',
+--     'bge-large-zh-v1.5',
+--     50
+--   );
+CREATE OR REPLACE FUNCTION hotd_embed_articles_batch_via_api(
+    p_api_url    TEXT DEFAULT 'http://localhost:8000/api/embedding',
+    p_api_key    TEXT DEFAULT NULL,
+    p_model_name TEXT DEFAULT NULL,
+    p_batch_size INT  DEFAULT 50
+)
+RETURNS void LANGUAGE plpython3u AS $$
+    import json
+    import urllib.request
+    import urllib.error
+    import urllib.parse
+
+    # 查询待向量化的文章
+    plan = plpy.prepare("""
+        SELECT id, 
+               title || '。' || COALESCE(summary, '') || '。' || COALESCE(full_text, '') AS text
+        FROM hotd_articles
+        WHERE (embedding IS NULL OR embedding = '[0]'::vector)
+          AND create_time > now() - INTERVAL '60 days'
+        LIMIT 1500
+    """)
+    rows = plpy.execute(plan)
+
+    if not rows:
+        plpy.notice("[HotD] 没有待向量化的文章")
+        return
+
+    texts = [r['text'] for r in rows]
+    ids   = [r['id']   for r in rows]
+    total = len(texts)
+    
+    plpy.notice(f"[HotD] 开始通过 HTTP API 向量化 {total} 条文章，API: {p_api_url}")
+
+    # 准备请求头
+    headers = {
+        'Content-Type': 'application/json'
+    }
+    if p_api_key:
+        headers['Authorization'] = f'Bearer {p_api_key}'
+
+    # 批量调用 API
+    all_embeddings = []
+    processed = 0
+    
+    for i in range(0, total, p_batch_size):
+        batch_texts = texts[i:i + p_batch_size]
+        batch_ids = ids[i:i + p_batch_size]
+        
+        # 构建请求体
+        request_body = {
+            'texts': batch_texts
+        }
+        if p_model_name:
+            request_body['model'] = p_model_name
+        
+        try:
+            # 发送 HTTP 请求
+            req = urllib.request.Request(
+                p_api_url,
+                data=json.dumps(request_body).encode('utf-8'),
+                headers=headers,
+                method='POST'
+            )
+            
+            with urllib.request.urlopen(req, timeout=300) as response:
+                response_data = json.loads(response.read().decode('utf-8'))
+            
+            # 解析响应（支持多种格式）
+            batch_embeddings = None
+            if 'embeddings' in response_data:
+                # 格式1: {"embeddings": [[...], [...]], "dimension": 1024}
+                batch_embeddings = response_data['embeddings']
+            elif 'data' in response_data:
+                # 格式2: {"data": [{"embedding": [...]}, ...]}
+                batch_embeddings = [item['embedding'] for item in response_data['data']]
+            elif isinstance(response_data, list):
+                # 格式3: [[...], [...]] 或 [{"embedding": [...]}, ...]
+                if len(response_data) > 0 and isinstance(response_data[0], dict):
+                    batch_embeddings = [item.get('embedding', item) for item in response_data]
+                else:
+                    batch_embeddings = response_data
+            else:
+                raise ValueError(f"无法解析 API 响应格式: {response_data.keys() if isinstance(response_data, dict) else type(response_data)}")
+            
+            if len(batch_embeddings) != len(batch_texts):
+                raise ValueError(f"API 返回的向量数量 ({len(batch_embeddings)}) 与请求的文本数量 ({len(batch_texts)}) 不匹配")
+            
+            all_embeddings.extend(batch_embeddings)
+            processed += len(batch_texts)
+            
+            plpy.notice(f"[HotD] 已处理 {processed}/{total} 条文章")
+            
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8') if hasattr(e, 'read') else str(e)
+            plpy.error(f"HTTP API 调用失败 (状态码 {e.code}): {error_body}")
+        except urllib.error.URLError as e:
+            plpy.error(f"无法连接到 API 服务器 {p_api_url}: {str(e)}")
+        except json.JSONDecodeError as e:
+            plpy.error(f"API 响应不是有效的 JSON: {str(e)}")
+        except Exception as e:
+            plpy.error(f"处理 API 响应时出错: {str(e)}")
+
+    if len(all_embeddings) != total:
+        plpy.error(f"向量化数量不匹配: 期望 {total}，实际 {len(all_embeddings)}")
+
+    # 更新数据库
+    update_plan = plpy.prepare(
+        "UPDATE hotd_articles SET embedding = $2 WHERE id = $1",
+        ["bigint", "vector"]
+    )
+    
+    for iid, vec in zip(ids, all_embeddings):
+        # 确保向量是列表格式，并转换为 float32
+        if not isinstance(vec, list):
+            vec = list(vec)
+        vec_float32 = [float(x) for x in vec]
+        plpy.execute(update_plan, [iid, vec_float32])
+
+    plpy.notice(f"[HotD] 本次成功通过 HTTP API 向量化 {total} 条文章，API: {p_api_url}")
+$$;
+
+-- =====================================================
 -- 6. 终极版 DBSCAN 热点事件聚类函数（效果拉满参数）
 -- =====================================================
 CREATE OR REPLACE FUNCTION hotd_event_clusters(

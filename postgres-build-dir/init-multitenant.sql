@@ -198,22 +198,28 @@ BEGIN
 END $$;
 
 -- 修改主键（添加 system_id）
--- 注意：需要先删除依赖的外键约束
+-- 注意：需要先删除所有依赖的外键约束
 DO $$
+DECLARE
+    fk_constraint RECORD;
 BEGIN
-    -- 删除 hotd_event_articles 表的外键约束（如果存在）
-    IF EXISTS (
-        SELECT 1 FROM pg_constraint 
-        WHERE conname = 'hotd_event_articles_snapshot_time_rank_no_fkey'
-    ) THEN
-        ALTER TABLE hotd_event_articles 
-        DROP CONSTRAINT hotd_event_articles_snapshot_time_rank_no_fkey;
-    END IF;
+    -- 查找并删除所有依赖 hotd_event_snapshot 主键的外键约束
+    FOR fk_constraint IN
+        SELECT conname, conrelid::regclass AS table_name
+        FROM pg_constraint
+        WHERE confrelid = 'hotd_event_snapshot'::regclass
+          AND contype = 'f'
+    LOOP
+        EXECUTE format('ALTER TABLE %s DROP CONSTRAINT IF EXISTS %I', 
+                       fk_constraint.table_name, 
+                       fk_constraint.conname);
+    END LOOP;
     
-    -- 删除旧的主键约束
+    -- 删除旧的主键约束（如果存在且还没有被删除）
     IF EXISTS (
         SELECT 1 FROM pg_constraint 
         WHERE conname = 'hotd_event_snapshot_pkey'
+          AND conrelid = 'hotd_event_snapshot'::regclass
     ) THEN
         ALTER TABLE hotd_event_snapshot 
         DROP CONSTRAINT hotd_event_snapshot_pkey;
@@ -325,8 +331,9 @@ LANGUAGE plpython3u AS $$
     max_limit = config['max_articles_limit'] or 80000
 
     # 查询该系统的文章（包括共享文章）
+    # 注意：使用 DISTINCT 时，ORDER BY 中的列必须出现在 SELECT 列表中
     query = f"""
-        SELECT DISTINCT a.id, a.title, a.weight, a.embedding
+        SELECT DISTINCT a.id, a.title, a.weight, a.embedding, a.create_time
         FROM hotd_articles a
         LEFT JOIN hotd_article_systems as_rel ON a.id = as_rel.article_id
         WHERE a.embedding IS NOT NULL
@@ -345,7 +352,22 @@ LANGUAGE plpython3u AS $$
         return []  # 返回空列表而不是 None
 
     ids      = [r['id'] for r in rows]
-    vectors = np.array([r['embedding'] for r in rows])
+    # PostgreSQL vector 类型在 PL/Python 中可能被转换为字符串，需要解析
+    # 处理格式：'[0.1,0.2,0.3]' 或 '{0.1,0.2,0.3}' 或已经是列表
+    vectors_list = []
+    for r in rows:
+        emb = r['embedding']
+        if isinstance(emb, str):
+            # 解析字符串格式的向量
+            emb_clean = emb.strip('[]{}')
+            vectors_list.append([float(x.strip()) for x in emb_clean.split(',') if x.strip()])
+        elif hasattr(emb, '__iter__') and not isinstance(emb, str):
+            # 如果已经是可迭代对象（列表、数组等），直接转换
+            vectors_list.append(list(emb))
+        else:
+            # 单个值（不应该发生，但以防万一）
+            vectors_list.append([float(emb)])
+    vectors = np.array(vectors_list, dtype=np.float32)
     titles  = [r['title'] for r in rows]
     weights = [float(r['weight'] or 1) for r in rows]
 
@@ -584,6 +606,163 @@ RETURNS void LANGUAGE plpython3u AS $$
 
     system_info = f"system_id={p_system_id}" if p_system_id is not None else "all systems"
     plpy.notice(f"[HotD] 本次成功向量化 {len(rows)} 条（{system_info}），使用模型：bge-large-zh-v1.5")
+$$;
+
+-- =====================================================
+-- 按系统通过 HTTP API 批量向量化函数（多租户版本）
+-- =====================================================
+-- 功能：通过 HTTP API 调用外部 embedding 服务，支持按系统过滤
+-- 参数说明：
+--   p_system_id: 系统ID（可选，NULL 表示处理所有系统）
+--   p_api_url: Embedding API 地址
+--   p_api_key: API 密钥（可选）
+--   p_model_name: 模型名称（可选）
+--   p_batch_size: 每次 API 调用处理的文本数量（默认 50）
+--
+-- 调用示例：
+--   SELECT hotd_embed_articles_batch_by_system_via_api(
+--     1,  -- 系统ID
+--     'http://localhost:8000/api/embedding',
+--     'your-api-key',
+--     'bge-large-zh-v1.5',
+--     50
+--   );
+CREATE OR REPLACE FUNCTION hotd_embed_articles_batch_by_system_via_api(
+    p_system_id  BIGINT DEFAULT NULL,
+    p_api_url    TEXT DEFAULT 'http://localhost:8000/api/embedding',
+    p_api_key    TEXT DEFAULT NULL,
+    p_model_name TEXT DEFAULT NULL,
+    p_batch_size INT  DEFAULT 50
+)
+RETURNS void LANGUAGE plpython3u AS $$
+    import json
+    import urllib.request
+    import urllib.error
+    import urllib.parse
+
+    # 构建查询（如果指定了系统ID，只处理该系统的文章）
+    if p_system_id is not None:
+        query = """
+            SELECT DISTINCT a.id, 
+                   a.title || '。' || COALESCE(a.summary, '') || '。' || COALESCE(a.full_text, '') AS text
+            FROM hotd_articles a
+            LEFT JOIN hotd_article_systems as_rel ON a.id = as_rel.article_id
+            WHERE (a.embedding IS NULL OR a.embedding = '[0]'::vector)
+              AND a.create_time > now() - INTERVAL '60 days'
+              AND a.is_deleted = false
+              AND (
+                a.system_id = %s 
+                OR as_rel.system_id = %s
+                OR (a.is_shared = true AND a.system_id IS NOT NULL)
+              )
+            LIMIT 1500
+        """ % (p_system_id, p_system_id)
+    else:
+        query = """
+            SELECT id, 
+                   title || '。' || COALESCE(summary, '') || '。' || COALESCE(full_text, '') AS text
+            FROM hotd_articles
+            WHERE (embedding IS NULL OR embedding = '[0]'::vector)
+              AND create_time > now() - INTERVAL '60 days'
+            LIMIT 1500
+        """
+
+    plan = plpy.prepare(query)
+    rows = plpy.execute(plan)
+
+    if not rows:
+        plpy.notice(f"[HotD] 没有待向量化的文章，系统ID: {p_system_id if p_system_id else 'ALL'}")
+        return
+
+    texts = [r['text'] for r in rows]
+    ids   = [r['id']   for r in rows]
+    total = len(texts)
+    
+    plpy.notice(f"[HotD] 开始通过 HTTP API 向量化 {total} 条文章，系统ID: {p_system_id if p_system_id else 'ALL'}，API: {p_api_url}")
+
+    # 准备请求头
+    headers = {
+        'Content-Type': 'application/json'
+    }
+    if p_api_key:
+        headers['Authorization'] = f'Bearer {p_api_key}'
+
+    # 批量调用 API
+    all_embeddings = []
+    processed = 0
+    
+    for i in range(0, total, p_batch_size):
+        batch_texts = texts[i:i + p_batch_size]
+        batch_ids = ids[i:i + p_batch_size]
+        
+        # 构建请求体
+        request_body = {
+            'texts': batch_texts
+        }
+        if p_model_name:
+            request_body['model'] = p_model_name
+        
+        try:
+            # 发送 HTTP 请求
+            req = urllib.request.Request(
+                p_api_url,
+                data=json.dumps(request_body).encode('utf-8'),
+                headers=headers,
+                method='POST'
+            )
+            
+            with urllib.request.urlopen(req, timeout=300) as response:
+                response_data = json.loads(response.read().decode('utf-8'))
+            
+            # 解析响应（支持多种格式）
+            batch_embeddings = None
+            if 'embeddings' in response_data:
+                batch_embeddings = response_data['embeddings']
+            elif 'data' in response_data:
+                batch_embeddings = [item['embedding'] for item in response_data['data']]
+            elif isinstance(response_data, list):
+                if len(response_data) > 0 and isinstance(response_data[0], dict):
+                    batch_embeddings = [item.get('embedding', item) for item in response_data]
+                else:
+                    batch_embeddings = response_data
+            else:
+                raise ValueError(f"无法解析 API 响应格式: {response_data.keys() if isinstance(response_data, dict) else type(response_data)}")
+            
+            if len(batch_embeddings) != len(batch_texts):
+                raise ValueError(f"API 返回的向量数量 ({len(batch_embeddings)}) 与请求的文本数量 ({len(batch_texts)}) 不匹配")
+            
+            all_embeddings.extend(batch_embeddings)
+            processed += len(batch_texts)
+            
+            plpy.notice(f"[HotD] 已处理 {processed}/{total} 条文章")
+            
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8') if hasattr(e, 'read') else str(e)
+            plpy.error(f"HTTP API 调用失败 (状态码 {e.code}): {error_body}")
+        except urllib.error.URLError as e:
+            plpy.error(f"无法连接到 API 服务器 {p_api_url}: {str(e)}")
+        except json.JSONDecodeError as e:
+            plpy.error(f"API 响应不是有效的 JSON: {str(e)}")
+        except Exception as e:
+            plpy.error(f"处理 API 响应时出错: {str(e)}")
+
+    if len(all_embeddings) != total:
+        plpy.error(f"向量化数量不匹配: 期望 {total}，实际 {len(all_embeddings)}")
+
+    # 更新数据库
+    update_plan = plpy.prepare(
+        "UPDATE hotd_articles SET embedding = $2 WHERE id = $1",
+        ["bigint", "vector"]
+    )
+    
+    for iid, vec in zip(ids, all_embeddings):
+        # 确保向量是列表格式，并转换为 float32
+        if not isinstance(vec, list):
+            vec = list(vec)
+        vec_float32 = [float(x) for x in vec]
+        plpy.execute(update_plan, [iid, vec_float32])
+
+    plpy.notice(f"[HotD] 本次成功通过 HTTP API 向量化 {total} 条文章，系统ID: {p_system_id if p_system_id else 'ALL'}，API: {p_api_url}")
 $$;
 
 -- =====================================================
