@@ -4,6 +4,9 @@ import com.hotdog.dto.HotEventResponseDTO;
 import com.hotdog.model.Article;
 import com.hotdog.model.HotEvent;
 import com.hotdog.service.HotEventService;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -13,6 +16,7 @@ import java.util.List;
 /**
  * 热点事件API
  */
+@Tag(name = "热点事件", description = "热点事件的查询、刷新、文章追溯等操作")
 @RestController
 @RequestMapping("/api/hot-events")
 @RequiredArgsConstructor
@@ -23,9 +27,10 @@ public class HotEventController {
     /**
      * 获取实时热点事件（调用聚类函数，较慢但最新，支持多系统）
      */
+    @Operation(summary = "获取实时热点事件", description = "调用聚类函数实时计算热点事件，较慢但数据最新")
     @GetMapping("/realtime")
     public ResponseEntity<List<HotEventResponseDTO>> getRealTimeHotEvents(
-            @RequestParam(required = false) Long systemId,
+            @Parameter(description = "系统ID，用于按系统查询") @RequestParam(required = false) Long systemId,
             @RequestParam(required = false) Integer hours,
             @RequestParam(required = false) Float eps,
             @RequestParam(required = false) Integer minSamples,
@@ -38,9 +43,10 @@ public class HotEventController {
     /**
      * 获取热点事件快照（高性能，适合高并发，支持多系统）
      */
+    @Operation(summary = "获取热点事件快照", description = "从快照表查询热点事件，高性能，适合高并发场景")
     @GetMapping("/snapshot")
     public ResponseEntity<List<HotEvent>> getHotEventsFromSnapshot(
-            @RequestParam(required = false) Long systemId,
+            @Parameter(description = "系统ID，用于按系统查询") @RequestParam(required = false) Long systemId,
             @RequestParam(defaultValue = "20") Integer limit) {
         List<HotEvent> events = hotEventService.getHotEventsFromSnapshot(systemId, limit);
         return ResponseEntity.ok(events);

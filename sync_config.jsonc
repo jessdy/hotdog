@@ -18,7 +18,7 @@
 		"deleteRemote": false,
 		"upload_to_root": false,
 		"distPath": [],
-		"remotePath": "/root/codes/hotdog/",
+		"remotePath": "/root/projects/hotdog/",
 		"excludePath": [],
 		"downloadPath": "",
 		"downloadExcludePath": [],

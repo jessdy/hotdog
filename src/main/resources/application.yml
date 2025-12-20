@@ -58,6 +58,14 @@ hotdog:
     default-eps: 0.38
     default-min-samples: 3
 
+# Knife4j (Swagger) 配置
+knife4j:
+  enable: true
+  setting:
+    language: zh_cn
+    swagger-model-name: 实体类
+  production: false
+
 logging:
   level:
     root: INFO

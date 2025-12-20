@@ -5,6 +5,9 @@ import com.hotdog.dto.ArticleQueryDTO;
 import com.hotdog.dto.ArticleShareDTO;
 import com.hotdog.model.Article;
 import com.hotdog.service.ArticleService;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.domain.Page;
@@ -19,6 +22,7 @@ import java.util.List;
 /**
  * 文章管理API
  */
+@Tag(name = "文章管理", description = "文章的创建、查询、更新、删除等操作")
 @RestController
 @RequestMapping("/api/articles")
 @RequiredArgsConstructor
@@ -29,6 +33,7 @@ public class ArticleController {
     /**
      * 创建文章
      */
+    @Operation(summary = "创建文章", description = "创建单篇文章，自动关联当前系统（通过 X-System-Code 请求头指定）")
     @PostMapping
     public ResponseEntity<Article> createArticle(@Valid @RequestBody ArticleCreateDTO dto) {
         Article article = articleService.createArticle(dto);
@@ -48,8 +53,10 @@ public class ArticleController {
     /**
      * 查询文章列表（支持按系统过滤）
      */
+    @Operation(summary = "查询文章列表", description = "支持按系统过滤、分页、来源、权重等条件筛选")
     @GetMapping
     public ResponseEntity<Page<Article>> queryArticles(
+            @Parameter(description = "系统ID，用于过滤文章") @RequestParam(required = false) Long systemId,
             @RequestParam(required = false) Long systemId,
             @RequestParam(required = false) String source,
             @RequestParam(required = false) BigDecimal minWeight,
@@ -91,6 +98,7 @@ public class ArticleController {
     /**
      * 将文章共享给指定系统
      */
+    @Operation(summary = "共享文章", description = "将文章共享给指定的系统（支持数据源重叠场景）")
     @PostMapping("/{id}/share")
     public ResponseEntity<Void> shareArticle(
             @PathVariable Long id,

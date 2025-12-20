@@ -22,12 +22,25 @@ public class WebConfig implements WebMvcConfigurer {
             .allowedMethods("GET", "POST", "PUT", "DELETE", "OPTIONS")
             .allowedHeaders("*")
             .maxAge(3600);
+        
+        // 允许访问 Knife4j 文档
+        registry.addMapping("/doc.html")
+            .allowedOrigins("*")
+            .allowedMethods("GET", "OPTIONS")
+            .allowedHeaders("*");
     }
     
     @Override
     public void addInterceptors(InterceptorRegistry registry) {
         registry.addInterceptor(systemContextInterceptor)
             .addPathPatterns("/api/**")
-            .excludePathPatterns("/api/systems/**"); // 系统管理接口不拦截
+            .excludePathPatterns(
+                "/api/systems/**",  // 系统管理接口不拦截
+                "/doc.html",        // Knife4j 文档页面
+                "/webjars/**",      // Knife4j 静态资源
+                "/v3/api-docs/**",  // Swagger API 文档
+                "/swagger-ui/**",   // Swagger UI
+                "/favicon.ico"      // 图标
+            );
     }
 }

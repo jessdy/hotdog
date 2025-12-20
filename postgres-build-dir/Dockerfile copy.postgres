@@ -61,14 +61,13 @@ RUN git clone https://github.com/jaiminpan/pg_jieba.git /tmp/pg-jieba \
     && git submodule update --init --recursive
 
 WORKDIR /tmp/pg-jieba
-RUN mkdir build && cd build && \
-    PG_INCLUDEDIR=$(pg_config --includedir) && \
-    PG_INCLUDEDIR_SERVER=$(pg_config --includedir-server) && \
-    cmake .. \
-        -DCMAKE_CXX_FLAGS="-std=c++11" \
-        -DPostgreSQL_TYPE_INCLUDE_DIR="$PG_INCLUDEDIR_SERVER" \
-        -DPostgreSQL_INCLUDE_DIR="$PG_INCLUDEDIR" \
-        -DPostgreSQL_INCLUDE_DIR_SERVER="$PG_INCLUDEDIR_SERVER" && \
+RUN sed -i 's/cmake_minimum_required(VERSION 3\.0)/cmake_minimum_required(VERSION 3.5)/g; \
+            s/cmake_minimum_required(VERSION 3\.1)/cmake_minimum_required(VERSION 3.5)/g; \
+            s/cmake_minimum_required(VERSION 3\.2)/cmake_minimum_required(VERSION 3.5)/g; \
+            s/cmake_minimum_required(VERSION 3\.3)/cmake_minimum_required(VERSION 3.5)/g; \
+            s/cmake_minimum_required(VERSION 3\.4)/cmake_minimum_required(VERSION 3.5)/g' CMakeLists.txt && \
+    mkdir build && cd build && \
+    cmake .. -DCMAKE_CXX_FLAGS="-std=c++11" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 && \ 
     make -j$(getconf _NPROCESSORS_ONLN) && \  
     make install && \
     # 验证 pg_jieba 扩展是否安装成功
@@ -102,38 +101,24 @@ RUN PG_LIBDIR=$(pg_config --pkglibdir) && \
     echo "Searching for pg_jieba files..." && \
     echo "PG_LIBDIR: $PG_LIBDIR" && \
     echo "PG_SHAREDIR: $PG_SHAREDIR" && \
-    # 打包 pg_jieba 库文件
+    find $PG_LIBDIR -name "*jieba*" -ls && \
+    find $PG_SHAREDIR/extension -name "*jieba*" -ls && \
     find $PG_LIBDIR -name "pg_jieba.so" -exec cp -v {} /pg_extensions/build/tmp/lib/ \; && \
-    # 打包 pg_jieba 扩展文件（.control 和 .sql）
     find $PG_SHAREDIR/extension -name "pg_jieba*" -exec cp -v {} /pg_extensions/build/tmp/share/extension/ \; && \
-    # 打包所有 jieba 相关文件（包括 .dict, .model, .idf, .utf8 等）
-    if [ -d "$PG_SHAREDIR/tsearch_data" ]; then \
-        find $PG_SHAREDIR/tsearch_data -type f \( -name "jieba*" -o -name "*jieba*" \) -exec cp -v {} /pg_extensions/build/tmp/share/tsearch_data/ \; 2>/dev/null || true; \
-    fi && \
-    # 如果 tsearch_data 中没有找到文件，尝试从源码目录复制
-    if [ ! -f "/pg_extensions/build/tmp/share/tsearch_data/jieba_base.dict" ] && [ -d "/tmp/pg-jieba" ]; then \
-        echo "Searching for jieba dict files in source directory..." && \
-        find /tmp/pg-jieba -type f \( -name "*jieba*.dict" -o -name "*jieba*.model" -o -name "*jieba*.idf" -o -name "*jieba*.utf8" \) -exec cp -v {} /pg_extensions/build/tmp/share/tsearch_data/ \; 2>/dev/null || true && \
-        find /tmp/pg-jieba -path "*/dict/*" -type f -exec cp -v {} /pg_extensions/build/tmp/share/tsearch_data/ \; 2>/dev/null || true; \
-    fi && \
+    # 复制所有 jieba 相关文件（包括 .dict, .model, .idf, .utf8 等）
+    find $PG_SHAREDIR/tsearch_data -type f \( -name "jieba*" -o -name "*jieba*" \) -exec cp -v {} /pg_extensions/build/tmp/share/tsearch_data/ \; 2>/dev/null || true && \
     echo "Files packaged for pg_jieba extension:" && \
     ls -la /pg_extensions/build/tmp/lib/*jieba* 2>/dev/null || echo "No pg_jieba.so found" && \
     ls -la /pg_extensions/build/tmp/share/extension/*jieba* 2>/dev/null || echo "No pg_jieba extension files found" && \
     echo "Files packaged for tsearch_data:" && \
     ls -la /pg_extensions/build/tmp/share/tsearch_data/ 2>/dev/null || echo "No tsearch_data files found" && \
-    # 打包其他扩展
     find $PG_LIBDIR -name "vector.so" -exec cp {} /pg_extensions/build/tmp/lib/ \; && \
     find $PG_SHAREDIR/extension -name "vector*" -exec cp {} /pg_extensions/build/tmp/share/extension/ \; && \
     find $PG_LIBDIR -name "pg_cron.so" -exec cp {} /pg_extensions/build/tmp/lib/ \; && \
     find $PG_SHAREDIR/extension -name "pg_cron*" -exec cp {} /pg_extensions/build/tmp/share/extension/ \; && \
     echo "All packaged files:" && \
     find /pg_extensions/build/tmp -type f -ls && \
-    # 验证关键文件是否存在
-    (test -f /pg_extensions/build/tmp/lib/pg_jieba.so && echo "✓ pg_jieba.so packaged") || echo "✗ pg_jieba.so NOT packaged" && \
-    (test -f /pg_extensions/build/tmp/share/extension/pg_jieba.control && echo "✓ pg_jieba.control packaged") || echo "✗ pg_jieba.control NOT packaged" && \
     tar czf /pg_extensions/build/pgextensions.tar.gz -C /pg_extensions/build/tmp lib share && \
-    echo "Extension package created, size:" && \
-    ls -lh /pg_extensions/build/pgextensions.tar.gz && \
     rm -rf /pg_extensions/build/tmp /tmp/pg-jieba /tmp/pgvector /tmp/pg_cron
 
 # Runtime 阶段：基础 PG 镜像 + 扩展
@@ -182,12 +167,9 @@ RUN PG_LIBDIR=$(pg_config --pkglibdir) && \
     tar zxf /pgextensions.tar.gz -C /tmp/pgextensions-extract && \
     echo "Extracted files:" && \
     find /tmp/pgextensions-extract -type f -ls && \
-    # 复制库文件
-    [ -d /tmp/pgextensions-extract/lib ] && cp -r /tmp/pgextensions-extract/lib/* $PG_LIBDIR/ 2>/dev/null || true && \
-    # 复制扩展文件
-    [ -d /tmp/pgextensions-extract/share/extension ] && cp -r /tmp/pgextensions-extract/share/extension/* $PG_SHAREDIR/extension/ 2>/dev/null || true && \
-    # 复制 tsearch_data 文件（pg_jieba 的字典文件等）
-    [ -d /tmp/pgextensions-extract/share/tsearch_data ] && cp -r /tmp/pgextensions-extract/share/tsearch_data/* $PG_SHAREDIR/tsearch_data/ 2>/dev/null || true && \
+    cp -r /tmp/pgextensions-extract/lib/* $PG_LIBDIR/ && \
+    cp -r /tmp/pgextensions-extract/share/extension/* $PG_SHAREDIR/extension/ && \
+    [ -d /tmp/pgextensions-extract/share/tsearch_data ] && cp -r /tmp/pgextensions-extract/share/tsearch_data/* $PG_SHAREDIR/tsearch_data/ || true && \
     echo "Installed pg_jieba files:" && \
     ls -la $PG_LIBDIR/*jieba* 2>/dev/null || echo "No pg_jieba.so in lib" && \
     ls -la $PG_SHAREDIR/extension/*jieba* 2>/dev/null || echo "No pg_jieba extension files" && \
@@ -197,9 +179,6 @@ RUN PG_LIBDIR=$(pg_config --pkglibdir) && \
     (test -f $PG_SHAREDIR/extension/pg_jieba--*.sql && echo "✓ pg_jieba SQL file exists" || echo "✗ pg_jieba SQL file missing") && \
     echo "Final tsearch_data files in runtime:" && \
     ls -la $PG_SHAREDIR/tsearch_data/ 2>/dev/null || echo "No tsearch_data files in runtime" && \
-    # 验证 pg_jieba 扩展是否可以被 PostgreSQL 识别
-    echo "Testing pg_jieba extension availability..." && \
-    (test -f $PG_LIBDIR/pg_jieba.so && test -f $PG_SHAREDIR/extension/pg_jieba.control && echo "✓ pg_jieba extension files are present") || echo "✗ pg_jieba extension files are missing" && \
     rm -rf /tmp/pgextensions-extract /pgextensions.tar.gz && \
     # 创建模型缓存目录并设置权限（用于 sentence-transformers）
     mkdir -p /var/lib/postgresql/.cache /tmp/.cache && \
@@ -207,9 +186,7 @@ RUN PG_LIBDIR=$(pg_config --pkglibdir) && \
     chmod -R 755 /var/lib/postgresql/.cache /tmp/.cache
 
 # 配置扩展：自动创建扩展（在 initdb 时运行）
-# 同时创建启动时配置脚本，确保 shared_preload_libraries 在每次启动时都正确配置
-RUN mkdir -p /docker-entrypoint-initdb.d /usr/local/bin && \
-    # 创建 initdb 时的配置脚本
+RUN mkdir -p /docker-entrypoint-initdb.d && \
     echo '#!/bin/bash' > /docker-entrypoint-initdb.d/00-pg_cron-config.sh && \
     echo 'set -e' >> /docker-entrypoint-initdb.d/00-pg_cron-config.sh && \
     echo '# 配置 pg_cron 和 pg_jieba 需要 shared_preload_libraries' >> /docker-entrypoint-initdb.d/00-pg_cron-config.sh && \
@@ -223,40 +200,6 @@ RUN mkdir -p /docker-entrypoint-initdb.d /usr/local/bin && \
     echo '    echo "pg_jieba not found, only pg_cron added to shared_preload_libraries"' >> /docker-entrypoint-initdb.d/00-pg_cron-config.sh && \
     echo 'fi' >> /docker-entrypoint-initdb.d/00-pg_cron-config.sh && \
     chmod +x /docker-entrypoint-initdb.d/00-pg_cron-config.sh && \
-    # 创建启动时配置脚本（每次启动时运行，确保配置正确）
-    echo '#!/bin/bash' > /usr/local/bin/configure-extensions.sh && \
-    echo 'set -e' >> /usr/local/bin/configure-extensions.sh && \
-    echo '# 配置 pg_cron 和 pg_jieba 的 shared_preload_libraries（每次启动时检查）' >> /usr/local/bin/configure-extensions.sh && \
-    echo 'PG_LIBDIR=$(pg_config --pkglibdir)' >> /usr/local/bin/configure-extensions.sh && \
-    echo 'CONF_FILE="${PGDATA}/postgresql.conf"' >> /usr/local/bin/configure-extensions.sh && \
-    echo '# 检查 pg_jieba.so 是否存在' >> /usr/local/bin/configure-extensions.sh && \
-    echo 'if [ -f "$PG_LIBDIR/pg_jieba.so" ]; then' >> /usr/local/bin/configure-extensions.sh && \
-    echo '    # 确保 shared_preload_libraries 包含 pg_jieba' >> /usr/local/bin/configure-extensions.sh && \
-    echo '    if grep -q "^shared_preload_libraries" "$CONF_FILE"; then' >> /usr/local/bin/configure-extensions.sh && \
-    echo '        # 如果已存在配置，更新它' >> /usr/local/bin/configure-extensions.sh && \
-    echo '        if ! grep -q "pg_jieba" "$CONF_FILE"; then' >> /usr/local/bin/configure-extensions.sh && \
-    echo '            sed -i "s/^shared_preload_libraries.*/shared_preload_libraries = '\''pg_cron,pg_jieba'\''/" "$CONF_FILE"' >> /usr/local/bin/configure-extensions.sh && \
-    echo '            echo "Updated shared_preload_libraries to include pg_jieba"' >> /usr/local/bin/configure-extensions.sh && \
-    echo '        fi' >> /usr/local/bin/configure-extensions.sh && \
-    echo '    else' >> /usr/local/bin/configure-extensions.sh && \
-    echo '        # 如果不存在配置，添加它' >> /usr/local/bin/configure-extensions.sh && \
-    echo '        echo "shared_preload_libraries = '\''pg_cron,pg_jieba'\''" >> "$CONF_FILE"' >> /usr/local/bin/configure-extensions.sh && \
-    echo '        echo "Added shared_preload_libraries with pg_jieba"' >> /usr/local/bin/configure-extensions.sh && \
-    echo '    fi' >> /usr/local/bin/configure-extensions.sh && \
-    echo 'else' >> /usr/local/bin/configure-extensions.sh && \
-    echo '    # pg_jieba 不存在，只配置 pg_cron' >> /usr/local/bin/configure-extensions.sh && \
-    echo '    if grep -q "^shared_preload_libraries" "$CONF_FILE"; then' >> /usr/local/bin/configure-extensions.sh && \
-    echo '        if grep -q "pg_jieba" "$CONF_FILE"; then' >> /usr/local/bin/configure-extensions.sh && \
-    echo '            sed -i "s/^shared_preload_libraries.*pg_jieba.*/shared_preload_libraries = '\''pg_cron'\''/" "$CONF_FILE"' >> /usr/local/bin/configure-extensions.sh && \
-    echo '            echo "Removed pg_jieba from shared_preload_libraries (not found)"' >> /usr/local/bin/configure-extensions.sh && \
-    echo '        fi' >> /usr/local/bin/configure-extensions.sh && \
-    echo '    else' >> /usr/local/bin/configure-extensions.sh && \
-    echo '        echo "shared_preload_libraries = '\''pg_cron'\''" >> "$CONF_FILE"' >> /usr/local/bin/configure-extensions.sh && \
-    echo '        echo "Added shared_preload_libraries with pg_cron only"' >> /usr/local/bin/configure-extensions.sh && \
-    echo '    fi' >> /usr/local/bin/configure-extensions.sh && \
-    echo 'fi' >> /usr/local/bin/configure-extensions.sh && \
-    chmod +x /usr/local/bin/configure-extensions.sh && \
-    # 创建扩展 SQL 脚本
     echo "CREATE EXTENSION IF NOT EXISTS vector;" > /docker-entrypoint-initdb.d/01-vector.sql && \
     echo "CREATE EXTENSION IF NOT EXISTS plpython3u;" > /docker-entrypoint-initdb.d/02-plpython3u.sql && \
     echo '-- pg_jieba 扩展创建（如果可用）' > /docker-entrypoint-initdb.d/03-pg_jieba.sql && \
@@ -271,31 +214,11 @@ RUN mkdir -p /docker-entrypoint-initdb.d /usr/local/bin && \
     echo 'EXCEPTION' >> /docker-entrypoint-initdb.d/03-pg_jieba.sql && \
     echo '    WHEN OTHERS THEN' >> /docker-entrypoint-initdb.d/03-pg_jieba.sql && \
     echo '        RAISE NOTICE '\''pg_jieba extension creation failed: %'\'', SQLERRM;' >> /docker-entrypoint-initdb.d/03-pg_jieba.sql && \
-    echo 'END $$;' >> /docker-entrypoint-initdb.d/03-pg_jieba.sql && \
-    # 创建启动前配置脚本（在 docker-entrypoint.sh 执行前运行）
-    # 这个脚本会被 docker-entrypoint.sh 在启动时自动执行（如果存在）
-    echo '#!/bin/bash' > /docker-entrypoint-initdb.d/99-configure-extensions.sh && \
-    echo 'set -e' >> /docker-entrypoint-initdb.d/99-configure-extensions.sh && \
-    echo '# 配置扩展的 shared_preload_libraries（在数据库启动前）' >> /docker-entrypoint-initdb.d/99-configure-extensions.sh && \
-    echo '/usr/local/bin/configure-extensions.sh || true' >> /docker-entrypoint-initdb.d/99-configure-extensions.sh && \
-    chmod +x /docker-entrypoint-initdb.d/99-configure-extensions.sh
+    echo 'END $$;' >> /docker-entrypoint-initdb.d/03-pg_jieba.sql
     # 注意：pg_cron 扩展的创建在 init.sql 中处理（因为需要处理配置参数可能不存在的情况）
-
-# 创建启动脚本，确保每次启动时都配置扩展
-# 这个脚本会在 PostgreSQL 启动前执行配置检查
-RUN echo '#!/bin/bash' > /usr/local/bin/postgres-start.sh && \
-    echo 'set -e' >> /usr/local/bin/postgres-start.sh && \
-    echo '# 在 PostgreSQL 启动前配置扩展（适用于已存在的数据库）' >> /usr/local/bin/postgres-start.sh && \
-    echo 'if [ -d "$PGDATA" ] && [ -f "$PGDATA/PG_VERSION" ]; then' >> /usr/local/bin/postgres-start.sh && \
-    echo '    # 数据库已存在，检查并更新配置' >> /usr/local/bin/postgres-start.sh && \
-    echo '    /usr/local/bin/configure-extensions.sh || true' >> /usr/local/bin/postgres-start.sh && \
-    echo 'fi' >> /usr/local/bin/postgres-start.sh && \
-    echo '# 调用原始 docker-entrypoint.sh' >> /usr/local/bin/postgres-start.sh && \
-    echo 'exec /usr/local/bin/docker-entrypoint.sh "$@"' >> /usr/local/bin/postgres-start.sh && \
-    chmod +x /usr/local/bin/postgres-start.sh
 
 # 暴露 PG 端口
 EXPOSE 5432
 
-# 使用自定义启动脚本，确保扩展配置正确
-CMD ["/usr/local/bin/postgres-start.sh", "postgres"]
+# 使用官方 PG entrypoint
+CMD ["docker-entrypoint.sh", "postgres"]

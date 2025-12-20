@@ -5,6 +5,9 @@ import com.hotdog.dto.SystemCreateDTO;
 import com.hotdog.model.System;
 import com.hotdog.model.SystemConfig;
 import com.hotdog.service.SystemService;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
@@ -15,6 +18,7 @@ import java.util.List;
 /**
  * 系统管理API
  */
+@Tag(name = "系统管理", description = "多租户系统的创建、配置、定时任务管理等操作")
 @RestController
 @RequestMapping("/api/systems")
 @RequiredArgsConstructor
@@ -25,6 +29,7 @@ public class SystemController {
     /**
      * 创建系统
      */
+    @Operation(summary = "创建系统", description = "创建新的多租户系统，并自动创建系统配置和定时任务")
     @PostMapping
     public ResponseEntity<System> createSystem(@Valid @RequestBody SystemCreateDTO dto) {
         System system = systemService.createSystem(dto);
