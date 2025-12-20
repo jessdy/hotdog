@@ -6,7 +6,6 @@ import com.hotdog.model.System;
 import com.hotdog.model.SystemConfig;
 import com.hotdog.service.SystemService;
 import io.swagger.v3.oas.annotations.Operation;
-import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;

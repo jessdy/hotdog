@@ -57,7 +57,6 @@ public class ArticleController {
     @GetMapping
     public ResponseEntity<Page<Article>> queryArticles(
             @Parameter(description = "系统ID，用于过滤文章") @RequestParam(required = false) Long systemId,
-            @RequestParam(required = false) Long systemId,
             @RequestParam(required = false) String source,
             @RequestParam(required = false) BigDecimal minWeight,
             @RequestParam(required = false) BigDecimal maxWeight,
